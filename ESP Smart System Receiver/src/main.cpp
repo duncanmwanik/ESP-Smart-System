@@ -3,89 +3,90 @@
 
 #define LIGHTS_PIN 4
 
-static BLEUUID senderUUID("d40d0e2d-0f4c-4a82-b769-c83863fad3d1");
-static BLEUUID senderCharacteristicUUID("e3e37507-a592-407a-904d-219cb1dc09ad");
+static BLEUUID bmeServiceUUID("6cc9c618-9f80-4147-bd7c-ac75e7de6ca5");
+static BLEUUID pressureCharacteristicUUID("12339484-d62d-4a19-8175-28600ee5afc7");
+static BLEAddress *pServerAddress;
+static BLERemoteCharacteristic *pressureCharacteristic;
 
-bool turnOnLights = false;
+static bool startConnectionToSender = false;
+static bool connectedToSender = false;
 
-static bool doConnect = false;
-static bool connected = false;
+static bool isMatSteppedOn = false;
 
-static BLEAddress *pServerAddress; // the sender address
-static BLERemoteCharacteristic *senderCharacteristic;
-
-class MyClientCallback : public BLEClientCallbacks
-{
-    void onConnect(BLEClient *pclient)
-    {
-    }
-
-    void onDisconnect(BLEClient *pclient)
-    {
-        connected = false;
-        Serial.println("Disconnected from sender...");
-    }
-};
-
-// Connect to the BLE Server that has the name, Service, and Characteristics
-bool connectToServer()
-{
-    Serial.println("Connecting to sender...");
-    BLEClient *pClient = BLEDevice::createClient();
-    pClient->setClientCallbacks(new MyClientCallback());
-
-    // Connect to sender
-    pClient->connect(*pServerAddress);
-
-    BLERemoteService *pRemoteService = pClient->getService(senderUUID);
-    if (pRemoteService == nullptr)
-    {
-        Serial.print("Failed to find our service UUID: ");
-        Serial.println(senderUUID.toString().c_str());
-        pClient->disconnect();
-        return (false);
-    }
-
-    senderCharacteristic = pRemoteService->getCharacteristic(senderCharacteristicUUID);
-
-    if (senderCharacteristic == nullptr)
-    {
-        Serial.print("Failed to find our characteristic UUID");
-        pClient->disconnect();
-        return false;
-    }
-
-    return true;
-}
+// Timing variables
+// We restart the receiver if it has not connected to sender for some time
+// Helps avoid failed reconnections
+unsigned long lastTime = 0;
+unsigned long idleTimeToRestart = 10000;
 
 // Callback function that gets called, when another device's advertisement has been received
 class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks
 {
     void onResult(BLEAdvertisedDevice advertisedDevice)
     {
-        Serial.print("BLE Advertised Device found: ");
-        Serial.println(advertisedDevice.toString().c_str());
-
         // if we find the sender, we stop the scan and connect to it
-        if (advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(senderUUID))
+        if (advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(bmeServiceUUID))
         {
-            BLEDevice::getScan()->stop();
+            advertisedDevice.getScan()->stop();
             pServerAddress = new BLEAddress(advertisedDevice.getAddress());
-            doConnect = true;
+            startConnectionToSender = true;
+            Serial.println("Found sender. Connecting...");
         }
     }
 };
 
+class MyClientCallback : public BLEClientCallbacks
+{
+    void onConnect(BLEClient *pclient)
+    {
+        Serial.println("Connected to sender...");
+        lastTime = millis(); // prevent idle restart since connection is present
+    }
+
+    void onDisconnect(BLEClient *pclient)
+    {
+        Serial.println("Disconnected from sender. Restarting...\n\n");
+        ESP.restart();
+    }
+};
+
+bool connectToSender(BLEAddress pAddress)
+{
+    BLEClient *pClient = BLEDevice::createClient();
+    pClient->setClientCallbacks(new MyClientCallback());
+
+    pClient->connect(pAddress);
+
+    // get sender BLE service
+    BLERemoteService *pRemoteService = pClient->getService(bmeServiceUUID);
+    if (pRemoteService == nullptr)
+    {
+        Serial.print("Failed to find sender service. UUID: ");
+        Serial.println(bmeServiceUUID.toString().c_str());
+        return (false);
+    }
+
+    // get sender pressure characteristic
+    pressureCharacteristic = pRemoteService->getCharacteristic(pressureCharacteristicUUID);
+    if (pressureCharacteristic == nullptr)
+    {
+        Serial.println("Failed to find sender characteristic.");
+        return false;
+    }
+
+    return true;
+}
+
 void setup()
 {
     Serial.begin(115200);
-    Serial.println("Starting receiver...");
+    Serial.println("\n\nStarting BLE Receiver...");
 
     // set lights pin to output
     pinMode(LIGHTS_PIN, OUTPUT);
 
-    // Init BLE device
-    BLEDevice::init("");
+    // Start receiver BLE and scan for devices
+    BLEDevice::init("ESP Receiver");
     BLEScan *pBLEScan = BLEDevice::getScan();
     pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
     pBLEScan->setActiveScan(true);
@@ -94,42 +95,50 @@ void setup()
 
 void loop()
 {
-    if (doConnect == true)
+    if (startConnectionToSender == true)
     {
-        if (connectToServer())
+        if (connectToSender(*pServerAddress))
         {
-            Serial.println("Connected to sender...");
-            connected = true;
+            connectedToSender = true;
         }
         else
         {
-            Serial.println("Failed to connect to the sender...");
-            connected = false;
+            Serial.println("Failed to connect to sender; Restarting receiver...\n\n");
+            ESP.restart();
         }
 
-        doConnect = false;
+        startConnectionToSender = false;
     }
 
-    if (connected)
+    if (connectedToSender)
     {
-        String pressureData = String(senderCharacteristic->readValue().c_str());
+        String pressureValue = String(pressureCharacteristic->readValue().c_str());
 
-        turnOnLights = pressureData == "1";
+        if (pressureValue == "1" || pressureValue == "0")
+        {
+            Serial.println("isMatSteppedOn: " + pressureValue);
+            isMatSteppedOn = pressureValue == "1";
 
-        if (turnOnLights)
-        {
-            digitalWrite(LIGHTS_PIN, HIGH);
-            Serial.println("Turned on lights!");
+            if (isMatSteppedOn)
+            {
+                digitalWrite(LIGHTS_PIN, HIGH);
+                Serial.println("Turned on lights!");
+            }
+            else
+            {
+                digitalWrite(LIGHTS_PIN, LOW);
+                Serial.println("Turned off lights!");
+            }
         }
-        else
-        {
-            digitalWrite(LIGHTS_PIN, LOW);
-            Serial.println("Turned off lights!");
-        }
+
+        // This delay prevents multiple reads of sender data on the same connection
+        delay(500);
     }
-    else
+
+    // This time will restart the receiver if a connection has not been made to sender after 10 seconds.
+    if (((millis() - lastTime) > idleTimeToRestart) && !connectedToSender)
     {
-        // start scanning for the sender device again
-        BLEDevice::getScan()->start(0);
+        Serial.println("Restarting due to idleness...\n\n");
+        ESP.restart();
     }
 }
